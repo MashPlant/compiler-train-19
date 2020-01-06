@@ -1,0 +1,241 @@
+
+#include <cstdint>
+#include <queue>
+#include <string>
+#include <unordered_map>
+
+#include <llvm/IR/CFG.h>
+#include <llvm/IR/InstVisitor.h>
+#include <llvm/IRReader/IRReader.h>
+#include <llvm/Support/SourceMgr.h>
+#include <llvm/Support/raw_ostream.h>
+#include <z3++.h>
+
+using u8 = unsigned char;
+using u32 = unsigned;
+using i8 = char;
+using i32 = int;
+
+using namespace llvm;
+using namespace z3;
+
+namespace {
+
+// Get unique name of a LLVM node. Applicable to BasicBlock and Instruction.
+std::string getName(const Value &Node) {
+  if (!Node.getName().empty())
+    return Node.getName().str();
+
+  std::string Str;
+  raw_string_ostream OS(Str);
+
+  Node.printAsOperand(OS, false);
+  return OS.str();
+}
+
+// Check
+void checkAndReport(z3::solver &solver, const GetElementPtrInst &gep) {
+  std::string name = getName(gep);
+  std::cout << "Checking with assertions:" << std::endl
+            << solver.assertions() << std::endl;
+  if (solver.check() == z3::sat)
+    std::cout << "GEP " << name << " is potentially out of bound." << std::endl
+              << "Model causing out of bound:" << std::endl
+              << solver.get_model() << std::endl;
+  else
+    std::cout << "GEP " << name << " is safe." << std::endl;
+}
+} // namespace
+
+// ONLY MODIFY THIS CLASS FOR PART 1 & 2!
+class Z3Walker : public InstVisitor<Z3Walker> {
+private:
+  std::unordered_map<BasicBlock *, std::vector<std::pair<BasicBlock *, z3::expr>>> cond_map;
+  z3::context ctx;
+  z3::solver solver;
+
+  z3::expr mk_operand(Value *v, u32 size) {
+    if (ConstantInt *ci = dyn_cast<ConstantInt>(v)) {
+      return ctx.bv_val(ci->getSExtValue(), size);
+    } else {
+      return ctx.bv_const(v->getName().str().c_str(), size);
+    }
+  }
+
+public:
+  Z3Walker() : ctx(), solver(ctx) {}
+
+  void visitModule(Module &m) {
+    std::queue<BasicBlock *> q;
+    std::unordered_map<BasicBlock *, u32> in_degs;
+    for (Function &f : m) {
+      solver.reset();
+      cond_map.clear();
+      in_degs.clear();
+      cond_map[&f.getEntryBlock()] = {{nullptr, ctx.bool_val(true)}};
+      for (BasicBlock &b : f) {
+        u32 in_deg = 0;
+        for (BasicBlock *_ : predecessors(&b)) {
+          ++in_deg;
+        }
+        in_degs[&b] = in_deg;
+      }
+      q.push(&f.getEntryBlock());
+      while (!q.empty()) {
+        BasicBlock *b = q.front();
+        q.pop();
+        visitBasicBlock(*b);
+        for (BasicBlock *succ : successors(b)) {
+          if (--in_degs[succ] == 0) {
+            q.push(succ);
+          }
+        }
+      }
+    }
+  }
+
+  void visitBasicBlock(BasicBlock &b) {
+    z3::expr enter_cond = ctx.bool_val(false);
+    for (std::pair<BasicBlock *, z3::expr> &p : cond_map[&b]) {
+      enter_cond = enter_cond || p.second;
+    }
+    for (Instruction &inst : b) {
+      if (BinaryOperator *bin = dyn_cast<BinaryOperator>(&inst)) {
+        u32 size = inst.getType()->getIntegerBitWidth();
+        z3::expr dst = ctx.bv_const(inst.getName().str().c_str(), size);
+        z3::expr l = mk_operand(bin->getOperand(0), size), r = mk_operand(bin->getOperand(1), size);
+        Instruction::BinaryOps op = bin->getOpcode();
+        switch (bin->getOpcode()) {
+        case Instruction::Add:
+          solver.add(l + r == dst);
+          break;
+        case Instruction::Sub:
+          solver.add(l - r == dst);
+          break;
+        case Instruction::Mul:
+          solver.add(l / r == dst);
+          break;
+        case Instruction::Shl:
+          solver.add(shl(l, r) == dst);
+          break;
+        case Instruction::LShr:
+          solver.add(lshr(l, r) == dst);
+          break;
+        case Instruction::AShr:
+          solver.add(ashr(l, r) == dst);
+          break;
+        case Instruction::And:
+          solver.add((l & r) == dst);
+          break;
+        case Instruction::Or:
+          solver.add((l | r) == dst);
+          break;
+        case Instruction::Xor:
+          solver.add((l ^ r) == dst);
+          break;
+        }
+      } else if (ICmpInst *icmp = dyn_cast<ICmpInst>(&inst)) {
+        z3::expr dst = ctx.bool_const(inst.getName().str().c_str());
+        u32 size = icmp->getOperand(0)->getType()->getIntegerBitWidth();
+        z3::expr l = mk_operand(icmp->getOperand(0), size), r = mk_operand(icmp->getOperand(1), size);
+        ICmpInst::Predicate op = icmp->getPredicate();
+        switch (op) {
+        case ICmpInst::ICMP_EQ:
+          solver.add((l == r) == dst);
+          break;
+        case ICmpInst::ICMP_NE:
+          solver.add((l != r) == dst);
+          break;
+        case ICmpInst::ICMP_UGT:
+          solver.add(ugt(l, r) == dst);
+          break;
+        case ICmpInst::ICMP_UGE:
+          solver.add(uge(l, r) == dst);
+          break;
+        case ICmpInst::ICMP_ULT:
+          solver.add(ult(l, r) == dst);
+          break;
+        case ICmpInst::ICMP_ULE:
+          solver.add(ule(l, r) == dst);
+          break;
+        case ICmpInst::ICMP_SGT:
+          solver.add((l > r) == dst);
+          break;
+        case ICmpInst::ICMP_SGE:
+          solver.add((l >= r) == dst);
+          break;
+        case ICmpInst::ICMP_SLT:
+          solver.add((l < r) == dst);
+          break;
+        case ICmpInst::ICMP_SLE:
+          solver.add((l <= r) == dst);
+          break;
+        }
+      } else if (BranchInst *br = dyn_cast<BranchInst>(&inst)) {
+        if (br->isUnconditional()) {
+          cond_map[br->getSuccessor(0)].push_back({&b, enter_cond});
+        } else {
+          z3::expr cond = ctx.bool_const(br->getCondition()->getName().str().c_str());
+          cond_map[br->getSuccessor(0)].push_back({&b, enter_cond && cond});  // if
+          cond_map[br->getSuccessor(1)].push_back({&b, enter_cond && !cond}); // else
+        }
+      } else if (PHINode *phi = dyn_cast<PHINode>(&inst)) {
+        std::vector<std::pair<BasicBlock *, z3::expr>> enter_conds = cond_map[&b];
+        u32 size = inst.getType()->getIntegerBitWidth();
+        z3::expr dst = ctx.bv_const(inst.getName().str().c_str(), size);
+        u32 idx = 0;
+        for (Value *v : phi->incoming_values()) {
+          BasicBlock *prev = phi->getIncomingBlock(idx++);
+          for (std::pair<BasicBlock *, z3::expr> &p : enter_conds) {
+            if (p.first == prev) {
+              solver.add(implies(p.second, dst == mk_operand(v, size)));
+              break;
+            }
+          }
+        }
+      } else if (GetElementPtrInst *gep = dyn_cast<GetElementPtrInst>(&inst)) {
+        if (gep->isInBounds()) {
+          if (ArrayType *arr_ty = dyn_cast<ArrayType>(gep->getSourceElementType())) {
+            Type *elem_ty = arr_ty->getElementType();
+            u32 elem_size = elem_ty->getIntegerBitWidth();
+            u32 len = arr_ty->getNumElements();
+            Value *idx = gep->getOperand(2);
+            u32 idx_size = idx->getType()->getIntegerBitWidth();
+            solver.push();
+            z3::expr idx1 = sext(mk_operand(idx, idx_size), 64 - idx_size);
+            solver.add(!(idx1 >= ctx.bv_val(0, 64) && idx1 < ctx.bv_val(len, 64)));
+            solver.add(enter_cond);
+            checkAndReport(solver, *gep);
+            solver.pop();
+          }
+        }
+      } else if (isa<ZExtInst>(&inst) || isa<SExtInst>(&inst)) {
+        u32 dst_size = inst.getType()->getIntegerBitWidth();
+        Value *src = inst.getOperand(0);
+        u32 src_size = src->getType()->getIntegerBitWidth();
+        z3::expr dst = ctx.bv_const(inst.getName().str().c_str(), dst_size);
+        solver.add(dst == (isa<ZExtInst>(&inst) ? zext : sext)(mk_operand(src, src_size), dst_size - src_size));
+      }
+    }
+  }
+};
+
+i32 main(i32 argc, i8 **argv) {
+  if (argc < 2) {
+    errs() << "Usage: " << argv[0] << " <IR file>\n";
+    return 1;
+  }
+
+  LLVMContext ctx;
+
+  // Parse the input LLVM IR file into a module.
+  SMDiagnostic err;
+  if (std::unique_ptr<Module> module = parseIRFile(argv[1], err, ctx)) {
+    Z3Walker().visitModule(*module);
+  } else {
+    err.print(argv[0], errs());
+    return 1;
+  }
+
+  return 0;
+}
